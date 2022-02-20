@@ -1,0 +1,533 @@
+#!/usr/bin/perl
+
+# {{{ CDDL HEADER
+#
+# This file and its contents are supplied under the terms of the
+# Common Development and Distribution License ("CDDL"), version 1.0.
+# You may only use this file in accordance with the terms of version
+# 1.0 of the CDDL.
+#
+# A full copy of the text of the CDDL should have accompanied this
+# source. A copy of the CDDL is also available via the Internet at
+# http://www.illumos.org/license/CDDL.
+# }}}
+
+# Copyright 2022 OmniOS Community Edition (OmniOSce) Association.
+
+use strict;
+use warnings;
+
+use POSIX qw(strftime);
+use Data::Dumper;
+use Text::Wrap;
+
+my $ErMatch = tokmatch(qw(
+EPERM ENOENT ESRCH EINTR EIO ENXIO E2BIG ENOEXEC EBADF ECHILD EAGAIN ENOMEM
+EACCES EFAULT ENOTBLK EBUSY EEXIST EXDEV ENODEV ENOTDIR EISDIR EINVAL ENFILE
+EMFILE ENOTTY ETXTBSY EFBIG ENOSPC ESPIPE EROFS EMLINK EPIPE EDOM ERANGE ENOMSG
+EIDRM ECHRNG EL2NSYNC EL3HLT EL3RST ELNRNG EUNATCH ENOCSI EL2HLT EDEADLK ENOLCK
+ECANCELED ENOTSUP EDQUOT EBADE EBADR EXFULL ENOANO EBADRQC EBADSLT EDEADLOCK
+EBFONT EOWNERDEAD ENOTRECOVERABLE ENOSTR ENODATA ETIME ENOSR ENONET ENOPKG
+EREMOTE ENOLINK EADV ESRMNT ECOMM EPROTO ELOCKUNMAPPED ENOTACTIVE EMULTIHOP
+EBADMSG ENAMETOOLONG EOVERFLOW ENOTUNIQ EBADFD EREMCHG ELIBACC ELIBBAD ELIBSCN
+ELIBMAX ELIBEXEC EILSEQ ENOSYS ELOOP ERESTART ESTRPIPE ENOTEMPTY EUSERS
+ENOTSOCK EDESTADDRREQ EMSGSIZE EPROTOTYPE ENOPROTOOPT EPROTONOSUPPORT
+ESOCKTNOSUPPORT EOPNOTSUPP EPFNOSUPPORT EAFNOSUPPORT EADDRINUSE EADDRNOTAVAIL
+ENETDOWN ENETUNREACH ENETRESET ECONNABORTED ECONNRESET ENOBUFS EISCONN ENOTCONN
+ESHUTDOWN ETOOMANYREFS ETIMEDOUT ECONNREFUSED EHOSTDOWN EHOSTUNREACH
+EWOULDBLOCK EALREADY EINPROGRESS ESTALE
+));
+
+my $EvMatch = tokmatch(qw(
+EDITOR HOME IFS OPTARG OPTIND PATH PWD SHELL TZ UMEM_DEBUG VISUAL
+LANG LC_ALL LC_COLLATE LC_CTYPE LC_MESSAGES LC_MONETARY LC_NUMERIC LC_TIME
+));
+
+my $DvMatch = tokmatch(qw(
+errno stdin stdout stderr
+NULL B_TRUE B_FALSE
+_REENTRANT _POSIX_PTHREAD_SEMANTICS
+SIGABRT SIGALRM SIGBUS SIGCANCEL SIGCHLD SIGCLD SIGCONT SIGEMT SIGFPE SIGFREEZE
+SIGHUP SIGILL SIGINFO SIGINT SIGIO SIGIOT SIGJVM1 SIGJVM2 SIGKILL SIGLOST
+SIGLWP SIGPIPE SIGPOLL SIGPROF SIGPWR SIGQUIT SIGRTMAX SIGRTMIN SIGSEGV SIGSTOP
+SIGSYS SIGTERM SIGTHAW SIGTRAP SIGTSTP SIGTTIN SIGTTOU SIGURG SIGUSR1 SIGUSR2
+SIGVTALRM SIGWAITING SIGWINCH SIGXCPU SIGXFSZ SIGXRES
+SIG_BLOCK SIG_DFL SIG_ERR SIG_HOLD SIG_IGN SIG_PF SIG_SETMASK SIG_UNBLOCK
+_SIGRTMAX _SIGRTMIN
+));
+
+# mdoc(7) closing delimiters (omitting parenthesis)
+my $cd = qr/[\.,:?!]/;
+
+my ($Nm, $Nd, $section, @names);
+my @lines = ();
+
+my ($listlevel, $listhead, $liststate);
+$liststate = 'none';
+
+my $cursec;
+my $eos = 1;
+
+# This first loop reads in the original man page line by line and just
+# grabs some information from the header and NAME section, and sorts out
+# paragraphs so that each sentence is a separate array element.
+for my $line (<>) {
+    $line = trim($line);
+
+    next if not length($line);
+
+    # man(7) allows ' as a macro character but the existing man pages only
+    # seem to use it for this pattern; just strip these lines and exit if any
+    # other is found.
+    next if $line =~ /^'\\" te?/;
+    die "Legacy macro character found in $line" if $line =~ /^'/;
+
+    die "Already in mandoc format\n" if $line =~ /^\.Os$/;
+
+    # .TH PS 1 "March 5, 2020" "OmniOS" "User Commands"
+    if (!$section && $line =~ /^\.TH/) {
+        $line =~ s/"//g;
+        ($Nm, $section) = ($line =~ /^\.TH\s+(\S+)\s+(\S+)/);
+        $Nm = lc $Nm;
+        $eos = 1;
+        next;
+    }
+
+    $cursec = $1 if $line =~ /^\.SH "?([^"]+)"?$/;
+
+    if (ismacro($line) || $line =~ /https?:/) {
+        push @lines, $line;
+        $eos = 1;
+        next;
+    }
+
+    my @sentences = map { trim($_) } split /(?<=\.)/, $line;
+
+    if ($cursec eq "NAME") {
+        # compress, uncompress, zcat \- compress, uncompress files or
+        # display expanded files
+        if (!$Nd) {
+            my $nlist;
+            ($nlist, $Nd) = ($line =~ /^(.*)\s+\\?-\s+(.*)$/);
+            @names = split /,\s*/, $nlist;
+        } else {
+            $Nd .= " " . $line;
+        }
+    }
+
+    # If we have a unfinished sentence from the previous line, append.
+    $lines[-1] .= " " . shift(@sentences) if (!$eos);
+    push @lines, @sentences;
+    $eos = $lines[-1] =~ /[\.:?!]$/;
+}
+
+######################################################################
+# Transformers
+#
+# Transformers are called in order of their defined priority.
+#
+# Transformers define a handler function which is called with three arguments:
+#   the current line
+#   the index of the current line in @lines
+#   the current section
+# and they return:
+#   undef - to discard the line
+#   a new string - to replace the old line
+#   an array of strings - to replace the old line
+#
+# Unless a transformer defines a 'macro' key, it will not be called for
+# macro lines.
+
+my %transformers = (
+    init => {
+        priority => 10,
+        macro => 1,
+        fn => sub {
+            my $l = shift;
+
+            $l =~ s/^\.SH\s+/.Sh /;
+            $l =~ s/^\.SS\s+/.Ss /;
+            $l =~ s/^\.sp$/.Pp/;
+
+            $l =~ s/"//g if $l =~ /^\.S[hs]/;
+
+            # Squash duplicate formatting strings
+            $l =~ s/(?:\\f([BIR])){2,}/\\f$1/g;
+
+            return $l;
+        },
+    },
+    Nm => {
+        priority => 20,
+        fn => sub {
+            my $l = shift;
+
+            $l =~ s/\\fB${Nm}\\fR($cd?)/\n.Nm $1\n/g;
+            return [ split /\n/, $l ];
+        },
+    },
+    'Fl-' => {
+        priority => 30,
+        fn => sub {
+            my ($l, $i, $s) = @_;
+
+            return $l if $s eq "SYNOPSIS";
+
+            $l =~ s/\\fB-(-\w+)\\fR($cd?)/\n.Fl \\&$1 $2\n/g;
+            return [ split /\n/, $l ];
+        },
+    },
+    Fl => {
+        priority => 31,
+        fn => sub {
+            my ($l, $i, $s) = @_;
+
+            return $l if $s eq "SYNOPSIS";
+
+            $l =~ s/\\fB-(\w+)\\fR($cd?)/\n.Fl $1 $2\n/g;
+            return [ split /\n/, $l ];
+        },
+    },
+    Xr => {
+        priority => 35,
+        fn => sub {
+            my $l = shift;
+
+            $l =~ s/\\fB(\w+)\\fR\((\d+\w*)\)($cd?)/\n.Xr $1 $2 $3\n/g;
+            return [ split /\n/, $l ];
+        },
+    },
+    Sy => {
+        priority => 40,
+        fn => sub {
+            my ($l, $i, $s) = @_;
+
+            return $l if $s eq "SYNOPSIS";
+
+            $l =~ s/\\fB([\/\*\w]+)\\fR($cd?)/\n.Sy $1 $2\n/g;
+            return [ split /\n/, $l ];
+        },
+    },
+    Em => {
+        priority => 41,
+        fn => sub {
+            my ($l, $i, $s) = @_;
+
+            return $l if $s eq "SYNOPSIS";
+
+            # XXX - probably can do better to derive Em or Ar from context
+            $l =~ s/\\fI(\w+)\\fR($cd?)/\n.Ar $1 $2\n/g;
+            $l =~ s/\\fI([\w\s]+)\\fR($cd?)/\n.%T $1 $2\n/g;
+            return [ split /\n/, $l ];
+        },
+    },
+    Dv => {
+        priority => 42,
+        macro => 1,
+        fn => sub {
+            my $l = shift;
+
+            if (ismacro($l)) {
+                $l =~ s/^\.(?:Sy|Ar) ($DvMatch)/.Dv $1/;
+            } else {
+                $l =~ s/($DvMatch)($cd?)/\n.Dv $1 $2\n/g;
+            }
+            return $l;
+        },
+    },
+    Ev => {
+        priority => 42,
+        macro => 1,
+        fn => sub {
+            my $l = shift;
+
+            if (ismacro($l)) {
+                $l =~ s/^\.Sy ($EvMatch)/.Ev $1/;
+            } else {
+                $l =~ s/($EvMatch)($cd?)/\n.Ev $1 $2\n/g;
+            }
+            return $l;
+        },
+    },
+    Er => {
+        priority => 42,
+        macro => 1,
+        fn => sub {
+            my $l = shift;
+
+            if (ismacro($l)) {
+                $l =~ s/^\.Sy ($ErMatch)/.Er $1/;
+            } else {
+                $l =~ s/($ErMatch)($cd?)/\n.Er $1 $2\n/g;
+            }
+            return $l;
+        },
+    },
+    Lk => {
+        priority => 43,
+        fn => sub {
+            my $l = shift;
+
+            $l =~ s/(https?:\S+)/\n.Lk $1\n/g;
+            return $l;
+        },
+    },
+    Pa => {
+        priority => 44,
+        macro => 1,
+        fn => sub {
+            my ($l, $i, $s) = @_;
+
+            $l =~ s/^\.Sy (\/.*)/.Pa $1/;
+            return $l;
+        },
+    },
+    Pq => {
+        priority => 997,
+        fn => sub {
+            my $l = shift;
+
+            $l =~ s/\(([^)]+)\)($cd?)/\n.Pq $1 $2\n/g;
+            return [ split /\n/, $l ];
+        },
+    },
+    Po => {
+        priority => 998,
+        fn => sub {
+            my $l = shift;
+
+            $l =~ s/\((.*)$/\n.Po\n$1/;
+            return [ split /\n/, $l ];
+        },
+    },
+    Pc => {
+        priority => 999,
+        fn => sub {
+            my $l = shift;
+
+            $l =~ s/^(.*)\)($cd?)/$1\n.Pc $2\n/;
+            return [ split /\n/, $l ];
+        },
+    },
+    Pp => {
+        priority => 1010,
+        macro => 1,
+        fn => sub {
+            my ($l, $i, $s) = @_;
+
+            return undef if $l eq ".Pp" &&
+                $lines[$i + 1] =~ /^\.(Bl|It)/;
+            return $l;
+        },
+    },
+    strip => {
+        priority => 1000,
+        macro => 1,
+        fn => sub {
+            my $l = shift;
+
+            $l =~ s/\\f[BIR]//g;
+            return undef if $l =~ /^[\.\s]*$/;
+            return undef if $l =~ /^\.[a-z]{2}(\s|$)/;
+            return undef if $l =~ /^\.[A-Z]{2}(\s|$)/;
+            return $l;
+        }
+    },
+    list => {
+        priority => 50,
+        macro => 1,
+        fn => sub {
+            my ($l, $i, $s) = @_;
+
+            # Lists in the illumos man pages tend to look like this:
+            # .ne 2
+            # .na
+            # .. list head
+            # .ad
+            # .sp ...
+            # .RS ...
+            # .. list body
+            # .RE
+            # A nested list will defer the .RE
+
+            return undef if $l =~ /^\s*$/;
+
+            #print STDERR "$liststate>> $l\n";
+
+            if ($l =~ /^\.(LP|Sh|Ss)/) {
+                # These always end all lists
+                if ($listlevel) {
+                    my $_listlevel = $listlevel;
+                    $listlevel = 0;
+                    return ['.El' x $_listlevel, $l];
+                }
+                return $l;
+            }
+
+            # Look for the start of a list
+            if ($l eq ".na" && $lines[$i - 1] eq ".ne 2") {
+                my $ostate = $liststate;
+                $liststate = 'head';
+                $listhead = '';
+
+                # Not in a list, or in a list body => new list
+                if (!$listlevel || $ostate eq 'body') {
+                    $listlevel++;
+                    return ".Bl -tag -width Ds";
+                }
+                return undef;
+            }
+
+            # Bulleted list
+            if ($l eq ".ie t \\(bu") {
+                my $ostate = $liststate;
+                $liststate = 'body';
+
+                # Not in a list, or in a list body => new list
+                if (!$listlevel || $ostate eq 'body') {
+                    $listlevel++;
+                    return [".Bl -bullet -width Ds", ".It"];
+                }
+                return ".It";
+            }
+
+            for ($liststate) {
+                /^none$/ && do {
+                    if ($l =~ /^\.RS \d/) {
+                        $liststate = 'body';
+                        return undef;
+                    }
+                    if ($l =~ /^\.RE/) {
+                        if ($listlevel) {
+                            $listlevel--;
+                            return '.El';
+                        }
+                    }
+                    last;
+                };
+                /^head$/ && do {
+                    # Check for the end
+                    if ($l =~ /^\.ad/) {
+                        $liststate = 'none';
+                        return $listhead;
+                    }
+                    if (!$listhead) {
+                        # .It line
+                        if (ismacro($l)) {
+                            $l =~ s/./.It /;
+                        } else {
+                            $l =~ s/^/.It /;
+                        }
+                        $listhead = $l;
+                    } else {
+                        # Continuation
+                        $l =~ s/^\.//;
+                        $listhead .= " $l" if length($l);
+                    }
+                    return undef;
+                };
+                /^body$/ && do {
+                    if ($l =~ /^\.RE/) {
+                        $liststate = 'none';
+                        return undef;
+                    }
+                    last;
+                };
+            }
+
+            return $l;
+        },
+    },
+);
+
+for my $xform (sort {
+    $transformers{$a}->{priority} <=> $transformers{$b}->{priority}
+    } keys %transformers) {
+
+    next if defined $transformers{$xform}->{disabled};
+    my @nlines = ();
+    $cursec = '';
+    while (my ($i, $line) = each @lines) {
+        $cursec = $1 if $line =~ /^\.Sh (.*)$/;
+
+        if (ismacro($line) && !defined $transformers{$xform}->{macro}) {
+            push @nlines, $line;
+            next;
+        }
+
+        my $newline = $transformers{$xform}->{fn}($line, $i, $cursec);
+        next if !defined $newline;
+
+        if (ref $newline eq "ARRAY") {
+            push @nlines, map { trim($_) } @$newline;
+        } else {
+            push @nlines, $newline;
+        }
+    }
+    @lines = @nlines;
+}
+
+######################################################################
+# Output
+
+# The file header - output until we run out of .\", wrapping appropriately.
+$Text::Wrap::columns = 76;
+for my $line (@lines) {
+    last if $line !~ /^\.\\"/;
+
+    if (length($line) > 80) {
+        print join "\n", wrap('', '.\" ', $line) . "\n.\\\"\n";
+    } else {
+        print "$line\n";
+    }
+}
+
+# Generate the mdoc(7) header
+
+print ".Dd " . strftime("%B %d, %Y", gmtime()) . "\n";
+print ".Dt " . (uc $Nm) . " " . $section . "\n";
+print ".Os\n";
+print ".Sh NAME\n";
+print ".Nm " . join(" ,\n.Nm ", @names) . "\n";
+print ".Nd $Nd\n";
+
+# Output the rest of the page - that's everything after the NAME section.
+
+$Text::Wrap::columns = 80;
+my $found = 0;
+for my $line (@lines) {
+    if ($found > 1) {
+        if (length($line) > 80 && !ismacro($line)) {
+            print join "\n", wrap('', '', $line) . "\n";
+        } else {
+            print "$line\n";
+        }
+        next;
+    }
+    if ($line =~ /^\.Sh (.*)$/) {
+        if ($1 eq "NAME") {
+            $found = 1;
+        } elsif ($found == 1) {
+            $found = 2;
+            print "$line\n";
+        }
+    }
+}
+
+sub tokmatch {
+    return qr/\b(?:@{[ join '|', @_ ]})\b/;
+}
+
+sub trim {
+    my $s = shift;
+    chomp $s;
+    $s =~ s/^\s+|\s+$//g;
+    return $s;
+}
+
+sub ismacro {
+    return shift =~ /^\./;
+}
+
+# Vim hints
+# vim:ts=4:sw=4:et:fdm=marker
