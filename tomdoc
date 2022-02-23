@@ -331,7 +331,7 @@ my %transformers = (
             return undef if $l =~ /^[\.\s]*$/;
             return undef if $l =~ /^\.[a-z]{2}(\s|$)/;
             return undef if $l =~ /^\.[A-Z]{2}(\s|$)/;
-            return $l;
+            return trim($l);
         }
     },
     list => {
