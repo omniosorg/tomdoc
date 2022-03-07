@@ -191,10 +191,14 @@ my %transformers = (
     },
     Xr => {
         priority => 35,
+        macro => 1,
         fn => sub {
-            my $l = shift;
+            my ($l, $i, $s) = @_;
 
-            $l =~ s/\\fB(\w+)\\fR\((\d+\w*)\)($cd?)/\n.Xr $1 $2 $3\n/g;
+            $l =~ s/\\fB(\w+)\\fR\((\d+\w*)\)($cd?)/\n.Xr $1 $2 $3\n/g
+                if !ismacro($l);
+            $l =~ s/^\.BR\s+(\w+)\s+\((\d+\w*)\)(,?)/.Xr $1 $2 $3/
+                if ismacro($l) && $s eq "SEE ALSO";
             return [ split /\n/, $l ];
         },
     },
