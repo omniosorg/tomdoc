@@ -1,8 +1,8 @@
 # Man page conversion helper
 
 This repository holds a small stand-alone utility which helps with converting
-illumos man pages from the legacy [man(7)](https://man.omnios.org/man.5) format
-to the newer [mdoc(7)](https://man.omnios.org/mdoc.5).
+illumos man pages from the legacy [man(7)](https://man.omnios.org/man.7) format
+to the newer [mdoc(7)](https://man.omnios.org/mdoc.7).
 
 It does not aim to completely automate conversion, the output will need
 reviewing and more work, but it does take care of the more laborious conversion
