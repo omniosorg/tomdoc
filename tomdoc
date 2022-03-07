@@ -202,6 +202,15 @@ my %transformers = (
             return [ split /\n/, $l ];
         },
     },
+    Fn => {
+        priority => 36,
+        fn => sub {
+            my ($l, $i, $s) = @_;
+
+            $l =~ s/\\fB(\w+)\(\)\\fR($cd?)/\n.Fn $1 $2\n/g;
+            return [ split /\n/, $l ];
+        },
+    },
     Sy => {
         priority => 40,
         fn => sub {
