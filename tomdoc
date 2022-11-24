@@ -44,8 +44,12 @@ LANG LC_ALL LC_COLLATE LC_CTYPE LC_MESSAGES LC_MONETARY LC_NUMERIC LC_TIME
 NLSPATH LD_LIBRARY
 ));
 
+my $VaMatch = tokmatch(qw(
+errno
+));
+
 my $DvMatch = tokmatch(qw(
-errno stdin stdout stderr
+stdin stdout stderr
 NULL B_TRUE B_FALSE
 NGROUPS_MAX
 _REENTRANT _POSIX_PTHREAD_SEMANTICS
@@ -236,6 +240,20 @@ my %transformers = (
             $l =~ s/\\fI(\w+)\\fR($cd?)/\n.Ar $1 $2\n/g;
             $l =~ s/\\fI([\w\s]+)\\fR($cd?)/\n.%T $1 $2\n/g;
             return [ split /\n/, $l ];
+        },
+    },
+    Va => {
+        priority => 42,
+        macro => 1,
+        fn => sub {
+            my $l = shift;
+
+            if (ismacro($l)) {
+                $l =~ s/^\.(?:Sy|Ar) ($VaMatch)/.Va $1/;
+            } else {
+                $l =~ s/($VaMatch)($cd?)/\n.Va $1 $2\n/g;
+            }
+            return $l;
         },
     },
     Dv => {
