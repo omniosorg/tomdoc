@@ -237,7 +237,8 @@ my %transformers = (
             return $l if $s eq "SYNOPSIS";
 
             # XXX - probably can do better to derive Em or Ar from context
-            $l =~ s/\\fI(\w+)\\fR($cd?)/\n.Ar $1 $2\n/g;
+            my $label = $section =~ /^[239]/ ? "Fa" : "Ar";
+            $l =~ s/\\fI(\w+)\\fR($cd?)/\n.$label $1 $2\n/g;
             $l =~ s/\\fI([\w\s]+)\\fR($cd?)/\n.%T $1 $2\n/g;
             return [ split /\n/, $l ];
         },
