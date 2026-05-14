@@ -73,6 +73,10 @@ my @lines = ();
 my ($listlevel, $listhead, $liststate);
 $liststate = 'none';
 
+# State for literal (.nf/.fi) display blocks and the SYNOPSIS prototype parser.
+my ($inliteral, $litsynopsis);
+my @synbuf;
+
 my $cursec;
 my $eos = 1;
 
@@ -80,6 +84,39 @@ my $eos = 1;
 # grabs some information from the header and NAME section, and sorts out
 # paragraphs so that each sentence is a separate array element.
 for my $line (<>) {
+    chomp $line;
+
+    # Literal (.nf/.fi) display blocks. Their contents must be preserved
+    # verbatim - not trimmed, blank-stripped or split into sentences. In the
+    # SYNOPSIS of a function page (sections 2/3/9) the framing is dropped and
+    # the contents (includes, prototypes) are converted by the Synopsis
+    # transformer; elsewhere the block becomes a .Bd -literal display.
+    if ($inliteral) {
+        if ($line =~ /^\.fi\b/) {
+            $inliteral = 0;
+            push @lines, '.Ed' unless $litsynopsis;
+            $eos = 1;
+            next;
+        }
+        $line =~ s/\s+$//;
+        push @lines, $line;
+        $eos = 1;
+        next;
+    }
+    if ($line =~ /^\.nf\b/) {
+        $inliteral = 1;
+        $litsynopsis = (($cursec // '') eq 'SYNOPSIS')
+            && defined $section && $section =~ /^[239]/;
+        unless ($litsynopsis) {
+            # Use -offset indent when the source indented the block.
+            my $offset = (@lines && $lines[-1] =~ /^\.in\s+\+/)
+                ? ' -offset indent' : '';
+            push @lines, ".Bd -literal$offset";
+        }
+        $eos = 1;
+        next;
+    }
+
     $line = trim($line);
 
     next if not length($line);
@@ -163,6 +200,53 @@ my %transformers = (
             $l =~ s/(?:\\f([BIR])){2,}/\\f$1/g;
 
             return $l;
+        },
+    },
+    # Convert the SYNOPSIS of function/library/header pages (sections 2/3/9):
+    # #include lines become .In, and C prototypes become .Ft/.Fo/.Fa/.Fc.
+    # Runs after init (so .SH has become .Sh) but before the running-text
+    # transformers - once the prototype is a set of macro lines the later
+    # transformers (Nm, Fn, Pq, ...) leave it alone.
+    Synopsis => {
+        priority => 15,
+        macro => 1,
+        fn => sub {
+            my ($l, $i, $s) = @_;
+
+            return $l if !defined $section || $section !~ /^[239]/;
+            # Fast path: nothing to do outside SYNOPSIS with no buffered proto.
+            return $l if $s ne "SYNOPSIS" && !@synbuf;
+
+            my @out;
+
+            # A line can only continue a buffered prototype if it is SYNOPSIS
+            # running text; otherwise flush what we have first.
+            my $proto_text = ($s eq "SYNOPSIS" && !ismacro($l)
+                && $l !~ /^\s*#\s*include/ && $l =~ /\S/);
+            push @out, flush_proto() if @synbuf && !$proto_text;
+
+            # Pass macro lines and anything outside SYNOPSIS through untouched.
+            if ($s ne "SYNOPSIS" || ismacro($l)) {
+                push @out, $l;
+                return \@out;
+            }
+
+            # #include <foo.h>  =>  .In foo.h
+            if ($l =~ /^\s*#\s*include\s*<([^>]+)>/) {
+                push @out, ".In $1";
+                return \@out;
+            }
+
+            # Blank lines within the SYNOPSIS are dropped.
+            (my $clean = $l) =~ s/\\f[BIR]//g;
+            $clean = trim($clean);
+            return (@out ? \@out : undef) if !length $clean;
+
+            # Accumulate a (possibly multi-line) prototype until it ends ');'.
+            push @synbuf, $clean;
+            push @out, flush_proto() if $synbuf[-1] =~ /;\s*$/;
+
+            return @out ? \@out : undef;
         },
     },
     Nm => {
@@ -352,7 +436,7 @@ my %transformers = (
             my ($l, $i, $s) = @_;
 
             return undef if $l eq ".Pp" &&
-                $lines[$i + 1] =~ /^\.(Bl|It)/;
+                $lines[$i + 1] =~ /^\.(Bl|It|Bd)/;
             return $l;
         },
     },
@@ -483,8 +567,22 @@ for my $xform (sort {
     next if defined $transformers{$xform}->{disabled};
     my @nlines = ();
     $cursec = '';
+    my $inbd = 0;
     while (my ($i, $line) = each @lines) {
         $cursec = $1 if $line =~ /^\.Sh (.*)$/;
+
+        # Never transform the contents of a literal display block; pass the
+        # .Bd/.Ed markers and everything between them through untouched.
+        if ($inbd) {
+            $inbd = 0 if $line =~ /^\.Ed\b/;
+            push @nlines, $line;
+            next;
+        }
+        if ($line =~ /^\.Bd\b.*-literal/) {
+            $inbd = 1;
+            push @nlines, $line;
+            next;
+        }
 
         if (ismacro($line) && !defined $transformers{$xform}->{macro}) {
             push @nlines, $line;
@@ -563,6 +661,83 @@ sub trim {
 
 sub ismacro {
     return shift =~ /^\./;
+}
+
+# Split a C argument list on top-level commas, keeping commas that are nested
+# inside parentheses (e.g. function-pointer arguments) or C comments together.
+sub split_args {
+    my $s = shift;
+    my @args;
+    my $cur = '';
+    my $depth = 0;
+    my ($i, $n) = (0, length $s);
+    while ($i < $n) {
+        if (substr($s, $i, 2) eq '/*') {
+            my $end = index($s, '*/', $i + 2);
+            $end = $n - 2 if $end < 0;
+            $cur .= substr($s, $i, $end + 2 - $i);
+            $i = $end + 2;
+            next;
+        }
+        my $c = substr($s, $i, 1);
+        if    ($c eq '(') { $depth++; $cur .= $c; }
+        elsif ($c eq ')') { $depth--; $cur .= $c; }
+        elsif ($c eq ',' && $depth <= 0) { push @args, $cur; $cur = ''; }
+        else  { $cur .= $c; }
+        $i++;
+    }
+    push @args, $cur;
+    return @args;
+}
+
+# Convert a single C prototype string into .Ft/.Fo/.Fa/.Fc lines. Returns an
+# array reference, or undef if it does not look like a function prototype.
+sub parse_prototype {
+    my $proto = shift;
+
+    $proto =~ s/\\f[BIR]//g;      # font escapes
+    $proto =~ s/\\&//g;           # roff zero-width escapes
+    $proto = trim($proto);
+
+    return undef unless $proto =~ /^(.*?\**)\s*(\w+)\s*\((.*)\)\s*;?$/s;
+    my ($ret, $name, $args) = (trim($1), $2, trim($3));
+    $ret =~ s{/\*.*?\*/}{}g;
+    $ret = trim($ret);
+
+    my @out = length($ret) ? (".Ft $ret") : ();
+    push @out, ".Fo $name";
+    if ($args eq '' || $args eq 'void') {
+        push @out, ".Fa void";
+    } else {
+        for my $a (split_args($args)) {
+            $a = trim($a);
+            next unless length $a;
+            # An argument written entirely as a C comment (and not a variadic
+            # placeholder list) denotes an optional argument, e.g. open(2)'s
+            # /* mode_t mode */  =>  .Op , Fa "mode_t mode"
+            if ($a =~ m{^/\*\s*(.*?)\s*\*/$} && $1 !~ /,/) {
+                push @out, qq{.Op , Fa "$1"};
+                next;
+            }
+            $a =~ s{/\*.*?\*/}{}g;          # strip any inline comment
+            $a = trim($a);
+            next unless length $a;
+            $a = '...' if $a =~ /\.\.\./;   # variadic
+            push @out, qq{.Fa "$a"};
+        }
+    }
+    push @out, ".Fc";
+    return \@out;
+}
+
+# Flush the buffered prototype lines, returning the converted macro lines (or
+# the raw text if it could not be parsed).
+sub flush_proto {
+    return () unless @synbuf;
+    my $proto = join(' ', @synbuf);
+    @synbuf = ();
+    my $parsed = parse_prototype($proto);
+    return $parsed ? @$parsed : ($proto);
 }
 
 # Vim hints
