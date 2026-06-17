@@ -16,8 +16,8 @@ it currently assumes that they are in a specific form) and it can handle
 nested lists and bullet points. Even when it gets this a bit wrong, there is
 still a lot less work needed by the human editor afterwards.
 
-It does not currently attempt to transform the `SYNOPSIS` or `ATTRIBUTES`
-sections beyond formatting.
+It does not currently attempt to transform the `ATTRIBUTES` section beyond
+formatting.
 The [illumos-gate prototype templates](https://github.com/illumos/illumos-gate/tree/master/usr/src/prototypes)
 provide useful guidance on completing conversion of `ATTRIBUTES` in particular.
 
