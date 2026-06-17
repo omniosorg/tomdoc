@@ -77,6 +77,20 @@ $liststate = 'none';
 my ($inliteral, $litsynopsis);
 my @synbuf;
 
+# State for the command-page SYNOPSIS parser.
+my (@cmdbuf, $prevcmd);
+
+# mdoc(7) macro names. A flag, argument or keyword whose text matches one of
+# these must be escaped with \& so mandoc does not reinterpret it as a macro
+# when it appears in argument position (e.g. an option named -Sm).
+my %mdoc_macro = map { $_ => 1 } qw(
+    Ac Ad An Ao Ap Aq Ar At Bc Bd Bf Bk Bl Bo Bq Brq Bro Bsx Bt Bx Cd Cm D1 Db
+    Dc Dd Dl Do Dq Dt Dv Dx Ec Ed Ef Ek El Em En Eo Er Es Ev Ex Fa Fc Fd Fl Fn
+    Fo Fr Ft Fx Hf Ic In It Lb Li Lk Lp Ms Mt Nd Nm No Ns Nx Oc Oo Op Os Ot Ox
+    Pa Pc Pf Po Pp Pq Qc Ql Qo Qq Re Rs Rv Sc Sh Sm So Sq Ss St Sx Sy Ta Tn Ud
+    Ux Va Vt Xc Xo Xr
+);
+
 my $cursec;
 my $eos = 1;
 
@@ -88,9 +102,10 @@ for my $line (<>) {
 
     # Literal (.nf/.fi) display blocks. Their contents must be preserved
     # verbatim - not trimmed, blank-stripped or split into sentences. In the
-    # SYNOPSIS of a function page (sections 2/3/9) the framing is dropped and
-    # the contents (includes, prototypes) are converted by the Synopsis
-    # transformer; elsewhere the block becomes a .Bd -literal display.
+    # SYNOPSIS of a function page (sections 2/3/9) or command page (sections
+    # 1/8) the framing is dropped and the contents are converted by the
+    # Synopsis/CmdSynopsis transformers; elsewhere the block becomes a
+    # .Bd -literal display.
     if ($inliteral) {
         if ($line =~ /^\.fi\b/) {
             $inliteral = 0;
@@ -106,7 +121,7 @@ for my $line (<>) {
     if ($line =~ /^\.nf\b/) {
         $inliteral = 1;
         $litsynopsis = (($cursec // '') eq 'SYNOPSIS')
-            && defined $section && $section =~ /^[239]/;
+            && defined $section && $section =~ /^[12389]/;
         unless ($litsynopsis) {
             # Use -offset indent when the source indented the block.
             my $offset = (@lines && $lines[-1] =~ /^\.in\s+\+/)
@@ -249,6 +264,48 @@ my %transformers = (
             return @out ? \@out : undef;
         },
     },
+    # Convert the SYNOPSIS of command pages (sections 1/8). Each usage form
+    # (a former .nf block, possibly spanning continuation lines) becomes an
+    # .Nm stanza with .Fl/.Op/.Ar/.Cm. Gated away from the function sections
+    # which are handled by Synopsis above.
+    CmdSynopsis => {
+        priority => 16,
+        macro => 1,
+        fn => sub {
+            my ($l, $i, $s) = @_;
+
+            return $l if !defined $section || $section !~ /^[18]/;
+            return $l if $s ne "SYNOPSIS" && !@cmdbuf;
+
+            # A continuation line is indented running text in the SYNOPSIS.
+            if ($s eq "SYNOPSIS" && @cmdbuf && !ismacro($l) && $l =~ /^\s+\S/) {
+                push @cmdbuf, trim($l);
+                return undef;
+            }
+
+            my @out;
+            push @out, flush_usage() if @cmdbuf;
+
+            # Pass macro lines and anything outside SYNOPSIS through untouched.
+            if ($s ne "SYNOPSIS" || ismacro($l)) {
+                # A section/subsection boundary already separates command
+                # groups, so do not also emit a .Pp after it.
+                $prevcmd = undef if $l =~ /^\.(Ss|SS|Sh|SH)\b/ || $s ne "SYNOPSIS";
+                push @out, $l;
+                return \@out;
+            }
+
+            # A new usage form must start with a bold (command) token.
+            if ($l =~ /^\s*\\fB/) {
+                push @cmdbuf, trim($l);
+                return @out ? \@out : undef;
+            }
+
+            # Not recognisable as a usage line; leave it for the human.
+            push @out, $l;
+            return \@out;
+        },
+    },
     Nm => {
         priority => 20,
         fn => sub {
@@ -256,6 +313,23 @@ my %transformers = (
 
             $l =~ s/\\fB${Nm}\\fR($cd?)/\n.Nm $1\n/g;
             return [ split /\n/, $l ];
+        },
+    },
+    # A hyphen used as a minus sign (before a digit) should be the \(mi glyph.
+    # Runs before the Fl transformers so a value such as \fB-1\fR becomes a
+    # minus rather than an option. Confined to running text: SYNOPSIS options
+    # and literal display blocks are left alone.
+    Minus => {
+        priority => 25,
+        fn => sub {
+            my ($l, $i, $s) = @_;
+
+            return $l if $s eq "SYNOPSIS";
+
+            $l =~ s/(\\f[BIRP])-(\d)/$1\\(mi$2/g;   # after a font escape
+            $l =~ s/\\-(\d)/\\(mi$1/g;              # an escaped hyphen
+            $l =~ s/(^|[\s(\[])-(\d)/$1\\(mi$2/g;   # at a word boundary
+            return $l;
         },
     },
     'Fl-' => {
@@ -276,7 +350,7 @@ my %transformers = (
 
             return $l if $s eq "SYNOPSIS";
 
-            $l =~ s/\\fB-(\w+)\\fR($cd?)/\n.Fl $1 $2\n/g;
+            $l =~ s/\\fB-(\w+)\\fR($cd?)/"\n.Fl " . esc($1) . " $2\n"/ge;
             return [ split /\n/, $l ];
         },
     },
@@ -298,7 +372,7 @@ my %transformers = (
         fn => sub {
             my ($l, $i, $s) = @_;
 
-            $l =~ s/\\fB(\w+)\(\)\\fR($cd?)/\n.Fn $1 $2\n/g;
+            $l =~ s/\\fB(\w+)\(\)\\fR($cd?)/"\n.Fn " . esc($1) . " $2\n"/ge;
             return [ split /\n/, $l ];
         },
     },
@@ -309,7 +383,7 @@ my %transformers = (
 
             return $l if $s eq "SYNOPSIS";
 
-            $l =~ s/\\fB([\/\*\w]+)\\fR($cd?)/\n.Sy $1 $2\n/g;
+            $l =~ s/\\fB([\/\*\w]+)\\fR($cd?)/"\n.Sy " . esc($1) . " $2\n"/ge;
             return [ split /\n/, $l ];
         },
     },
@@ -322,7 +396,7 @@ my %transformers = (
 
             # XXX - probably can do better to derive Em or Ar from context
             my $label = $section =~ /^[239]/ ? "Fa" : "Ar";
-            $l =~ s/\\fI(\w+)\\fR($cd?)/\n.$label $1 $2\n/g;
+            $l =~ s/\\fI(\w+)\\fR($cd?)/"\n.$label " . esc($1) . " $2\n"/ge;
             $l =~ s/\\fI([\w\s]+)\\fR($cd?)/\n.%T $1 $2\n/g;
             return [ split /\n/, $l ];
         },
@@ -407,7 +481,8 @@ my %transformers = (
         fn => sub {
             my $l = shift;
 
-            $l =~ s/\(([^)]+)\)($cd?)/\n.Pq $1 $2\n/g;
+            # The (?<!\\) avoids treating an escape such as \(mi as an open paren.
+            $l =~ s/(?<!\\)\(([^)]+)\)($cd?)/\n.Pq $1 $2\n/g;
             return [ split /\n/, $l ];
         },
     },
@@ -416,7 +491,7 @@ my %transformers = (
         fn => sub {
             my $l = shift;
 
-            $l =~ s/\((.*)$/\n.Po\n$1/;
+            $l =~ s/(?<!\\)\((.*)$/\n.Po\n$1/;
             return [ split /\n/, $l ];
         },
     },
@@ -557,6 +632,14 @@ my %transformers = (
 
             return $l;
         },
+        # Close any list left open when the input ends (e.g. a list that is
+        # the last thing in the page, with no following .Sh/.LP to end it).
+        post => sub {
+            return () unless $listlevel;
+            my $n = $listlevel;
+            $listlevel = 0;
+            return ('.El') x $n;
+        },
     },
 );
 
@@ -597,6 +680,11 @@ for my $xform (sort {
         } else {
             push @nlines, $newline;
         }
+    }
+    # Allow a transformer to emit trailing lines once the input is exhausted
+    # (e.g. to close any list still open at end of file).
+    if (my $post = $transformers{$xform}->{post}) {
+        push @nlines, $post->();
     }
     @lines = @nlines;
 }
@@ -738,6 +826,185 @@ sub flush_proto {
     @synbuf = ();
     my $parsed = parse_prototype($proto);
     return $parsed ? @$parsed : ($proto);
+}
+
+# Tokenise a command usage string into a list of typed tokens. Uses a font
+# state machine (\fB bold, \fI italic, \fR/\fP roman) rather than matching
+# \fX...\fR pairs, because the init transformer collapses adjacent font codes
+# such as \fR\fI and drops the intervening reset. Each token is a hashref with
+# a type ('FL','BOLD','AR','WORD','LB','RB','PIPE','ELL'), an optional value
+# and a 'sp' flag recording whether whitespace preceded it.
+sub usage_tokens {
+    my $s = shift;
+    my @toks;
+    my $font = 'R';
+    my $sp = 1;
+    while (length $s) {
+        if ($s =~ s/^\s+//)         { $sp = 1; next; }
+        if ($s =~ s/^\\f([BIRP])//) { $font = $1 eq 'P' ? 'R' : $1; next; }
+        if ($s =~ s/^\[//)     { push @toks, { t => 'LB',   sp => $sp }; $sp = 0; next; }
+        if ($s =~ s/^\]//)     { push @toks, { t => 'RB',   sp => $sp }; $sp = 0; next; }
+        if ($s =~ s/^\|//)     { push @toks, { t => 'PIPE', sp => $sp }; $sp = 0; next; }
+        if ($s =~ s/^\.\.\.//) { push @toks, { t => 'ELL',  sp => $sp }; $sp = 0; next; }
+        if ($s =~ s/^([^\s\[\]|\\]+)//) {
+            my $v = $1;
+            my $ell = ($v =~ s/\.\.\.$//) ? 1 : 0;   # ellipsis attached to word
+            if (length $v) {
+                # A leading dash means an option regardless of font - some
+                # pages do not embolden their option strings.
+                my $t = $v =~ /^-/   ? 'FL'
+                      : $font eq 'I' ? 'AR'
+                      : $font eq 'B' ? 'BOLD'
+                      : 'WORD';
+                push @toks, { t => $t, v => $v, sp => $sp };
+                $sp = 0;
+            }
+            push @toks, { t => 'ELL', sp => 0 } if $ell;
+            next;
+        }
+        $s =~ s/^.//;   # discard stray character (e.g. a lone backslash)
+    }
+    return \@toks;
+}
+
+# Escape a flag/argument/keyword that would otherwise be taken as an mdoc macro.
+sub esc {
+    my $v = shift;
+    return $mdoc_macro{$v} ? "\\&$v" : $v;
+}
+
+# Render the argument text for a flag token. The leading dash is stripped
+# because .Fl re-adds it; a long option (a second leading dash) keeps that
+# dash as a literal (\&-, the illumos convention) and macro-name collisions
+# are escaped. Returns '' for a bare "-".
+sub flag_arg {
+    my $f = substr(shift, 1);
+    return '' unless length $f;
+    return $f =~ /^-/ ? "\\&$f" : esc($f);
+}
+
+# Render a single token's argument text (escaped) and its mdoc macro keyword.
+# Returns (keyword, value); keyword is '' for tokens that do not introduce one.
+sub tok_macro {
+    my $t = shift;
+    if ($t->{t} eq 'FL') {
+        my $f = flag_arg($t->{v});
+        return ('Fl', length $f ? $f : '-');
+    }
+    return ('Ar', esc($t->{v})) if $t->{t} eq 'AR';
+    return ('Cm', esc($t->{v})) if $t->{t} eq 'BOLD';
+    return ('',   esc($t->{v})) if $t->{t} eq 'WORD';
+    return ();
+}
+
+# Convert a list of tokens (the contents of a [ ... ] group, possibly with
+# nested groups) into a single chained mdoc argument string, e.g. "Fl a | s",
+# "Fl S Ar system_name", or "Ar utility Oo Ar arg Oc".
+sub chain_tokens {
+    my $toks = shift;
+    my @parts;
+    my $cur = '';
+    my ($i, $n) = (0, scalar @$toks);
+    while ($i < $n) {
+        my $t = $toks->[$i];
+        if ($t->{t} eq 'LB') {
+            my ($inner, $next) = gather_bracket($toks, $i);
+            $i = $next;
+            push @parts, 'Oo', chain_tokens($inner), 'Oc';
+            $cur = '';
+            next;
+        }
+        if ($t->{t} eq 'PIPE') {
+            push @parts, '|';          # keeps the current macro context
+        } elsif ($t->{t} eq 'ELL') {
+            push @parts, $t->{sp} ? '...' : ('Ns', '...');
+        } else {
+            my ($kw, $v) = tok_macro($t);
+            push @parts, $kw if $kw && $kw ne $cur;
+            $cur = $kw;
+            push @parts, $v if defined $v && length $v;
+        }
+        $i++;
+    }
+    return join(' ', grep { length } @parts);
+}
+
+# Given the tokens and the index of an LB, return (\@inner, $next_index) where
+# @inner is the balanced bracket contents and $next_index is just past the RB.
+sub gather_bracket {
+    my ($toks, $i) = @_;
+    my @inner;
+    my $depth = 1;
+    my $n = scalar @$toks;
+    $i++;
+    while ($i < $n && $depth) {
+        my $tt = $toks->[$i]{t};
+        if    ($tt eq 'LB') { $depth++; }
+        elsif ($tt eq 'RB') { $depth--; last unless $depth; }
+        push @inner, $toks->[$i];
+        $i++;
+    }
+    $i++;   # consume the closing RB
+    return (\@inner, $i);
+}
+
+# Convert one tokenised usage form into mdoc lines (.Nm/.Fl/.Op/.Ar/.Cm).
+sub convert_usage {
+    my $toks = shift;
+    my @lines;
+    my ($i, $n) = (0, scalar @$toks);
+    my $cmdseen = 0;
+    while ($i < $n) {
+        my $t = $toks->[$i];
+        if ($t->{t} eq 'LB') {
+            my ($inner, $next) = gather_bracket($toks, $i);
+            $i = $next;
+            my $trail = '';
+            if ($i < $n && $toks->[$i]{t} eq 'ELL') {
+                $trail = $toks->[$i]{sp} ? ' ...' : ' Ns ...';
+                $i++;
+            }
+            push @lines, ".Op " . chain_tokens($inner) . $trail;
+            next;
+        }
+        if (!$cmdseen && ($t->{t} eq 'BOLD' || $t->{t} eq 'FL')) {
+            $cmdseen = 1;
+            push @lines, ($t->{v} eq $Nm) ? ".Nm" : ".Nm $t->{v}";
+        } elsif ($t->{t} eq 'FL') {
+            my $f = flag_arg($t->{v});
+            push @lines, length $f ? ".Fl $f" : ".Fl";
+        } elsif ($t->{t} eq 'BOLD') {
+            push @lines, ".Cm " . esc($t->{v});
+        } elsif ($t->{t} eq 'AR') {
+            my $line = ".Ar " . esc($t->{v});
+            if ($i + 1 < $n && $toks->[$i + 1]{t} eq 'ELL') {
+                $line .= $toks->[$i + 1]{sp} ? ' ...' : ' Ns ...';
+                $i++;
+            }
+            push @lines, $line;
+        }
+        $i++;
+    }
+    return \@lines;
+}
+
+# Flush the buffered command usage form, converting it and inserting a .Pp
+# between distinct command-name groups.
+sub flush_usage {
+    return () unless @cmdbuf;
+    my $usage = join(' ', @cmdbuf);
+    @cmdbuf = ();
+
+    my $lines = convert_usage(usage_tokens($usage));
+    return () unless $lines && @$lines;
+
+    my @res;
+    my ($cmd) = ($lines->[0] =~ /^\.Nm\s*(.*)$/);
+    $cmd //= '';
+    push @res, '.Pp' if defined $prevcmd && $cmd ne $prevcmd;
+    $prevcmd = $cmd;
+    push @res, @$lines;
+    return @res;
 }
 
 # Vim hints
